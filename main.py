@@ -1,8 +1,15 @@
 import asyncio
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain.agents import create_react_agent
 from dotenv import load_dotenv
+from langchain_core.messages import ToolMessage
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+import json
+
+from prompts.llm_prompts import _prompts, final_response_prompt
 
 load_dotenv()
 
@@ -19,68 +26,41 @@ SERVERS = {
     }
 }
 
-_prompts = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """
-You are a helpful AI assistant.
 
-You have access to calculator tools that can perform mathematical operations.
+_question = "how much is 5 plus 3"
 
-Your behavior should follow these rules:
+final_llm = HuggingFaceEndpoint(repo_id="meta-llama/Llama-3.1-8B-Instruct")
 
-1. General Questions:
-- If the user asks general knowledge, explanations, or casual questions, answer normally in a clear and helpful way.
-
-2. Calculations:
-- If the user asks anything involving math, numbers, arithmetic, or calculations (e.g., addition, subtraction, percentages, formulas, etc.), you MUST use the calculator tools.
-- Do NOT calculate manually if a tool is available.
-- Always prefer tool usage for accuracy.
-
-3. Mixed Queries:
-- If a question contains both explanation and calculation, use the tool for the calculation part and explain the result clearly.
-
-4. Clarity:
-- Keep answers simple, clear, and concise.
-- Show the final answer clearly.
-
-5. Strict Rule:
-- Never guess or approximate calculations when a tool is available.
-- Always rely on tools for numerical results.
-
-Examples:
-- User: "What is 25 * 18?"
-  → Use calculator tool
-
-- User: "Explain what inflation is"
-  → Answer normally
-
-- User: "If I earn 5000 and spend 1200, how much is left?"
-  → Use calculator tool, then explain result
-
-You are reliable, accurate, and tool-aware.
-     """,
-        ),
-        ("human", "{user_input}"),
-    ]
-)
+final_result_model = ChatHuggingFace(llm=final_llm)
 
 
 async def main():
     client = MultiServerMCPClient(SERVERS)
     tools = await client.get_tools()
-    llm = HuggingFaceEndpoint(
-        repo_id="meta-llama/Llama-3.1-8B-Instruct", task="text-generation"
-    )
+    tool_map = {tool.name: tool for tool in tools}
+    llm = HuggingFaceEndpoint(repo_id="Qwen/Qwen2.5-7B-Instruct")
 
     model = ChatHuggingFace(llm=llm)
-    model.bind_tools(tools)
+    model_with_tools = model.bind_tools(tools)
+    model = _prompts | model_with_tools
+    response = await model.ainvoke({"user_input": _question})
 
-    llm_chain = _prompts | model
-    response = await llm_chain.ainvoke({"user_input": "how much is 4 + 9"})
+    tool_messages = []
+    for response_tools in response.tool_calls:
 
-    print(response)
+        func_name = response_tools["name"]
+        func_args = response_tools.get("args") or {}
+        func_id = response_tools["id"]
+        result = await tool_map[func_name].ainvoke(func_args)
+        tool_messages.append(
+            ToolMessage(tool_call_id=func_id, content=json.dumps(result))
+        )
+
+    final_response_prompt.format(question=_question, context=result)
+    fr = final_response_prompt | final_result_model | StrOutputParser()
+    result = await fr.ainvoke({"question": _question, "context": result})
+
+    print(result)
 
 
 if __name__ == "__main__":
